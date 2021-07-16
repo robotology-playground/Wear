@@ -11,8 +11,10 @@
 <device type="iframetransform_to_iwear" name="IFrameTransformToIWear">
 
     <param name="wearableName">TransformServer</param>
-    <param name="rootFrameID">rootFrame</param>
+    <param name="rootFrameID">ground</param>
     <param name="wearableSensorType">PoseSensor</param>
+
+    <param name="frameIDs">(ground /iCub/root_link_fake)</param>
     
     <action phase="startup" level="5" type="attach">
         <paramlist name="networks">
@@ -31,7 +33,7 @@
 
     <action phase="startup" level="5" type="attach">
         <paramlist name="networks">
-            <elem name="IWearWrapperLabel">IAnalogSensorToIWear</elem>
+            <elem name="IWearWrapperLabel">IFrameTransformToIWear</elem>
         </paramlist>
     </action>
     <action phase="shutdown" level="5" type="detach"/>

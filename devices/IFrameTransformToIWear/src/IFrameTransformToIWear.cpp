@@ -13,6 +13,7 @@
 #include <yarp/sig/Vector.h>
 
 #include <mutex>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -27,7 +28,61 @@ struct ParsedOptions
 {
     wearable::WearableName wearableName;
     wearable::sensor::SensorType wearableSensorType;
-    std::string rootFrameId;
+    std::string rootFrameID;
+
+    std::vector< std::string > frameIDs;
+};
+
+// Class that provides each frame information, and utilites
+// to map its data to containers compatible with IWear
+class IFrameTransformHandler
+{
+public:
+    IFrameTransformHandler(const std::string targetFrame,
+                           const std::string rootFrame,
+                           yarp::dev::IFrameTransform* frameTransformInterface)
+    : m_targetFrame(targetFrame)
+    , m_rootFrame(rootFrame)
+    , m_frameTransformInterface(frameTransformInterface)
+    , m_matrixBuffer(yarp::sig::Matrix(4,4))
+    {};
+
+    wearable::sensor::SensorStatus getStatus() {
+        if (m_frameTransformInterface->canTransform(m_targetFrame, m_rootFrame)) {
+            return SensorStatus::Ok;
+        }
+        else {
+            return SensorStatus::Error;
+        }
+    }
+
+    bool getTransform(wearable::Quaternion& quaternion, wearable::Vector3& position) {
+
+        if (!m_frameTransformInterface->getTransform(m_targetFrame, m_rootFrame, m_matrixBuffer)) {
+            return false;
+        }
+
+        position[0] = m_matrixBuffer(0,3);
+        position[1] = m_matrixBuffer(1,3);
+        position[2] = m_matrixBuffer(2,3);
+
+        for(size_t r=0; r<3; r++)
+        {
+            for( size_t c=0; c<3; c++)
+            {
+                m_rotationMatrixBuffer[r][c] = m_matrixBuffer(r, c);
+            }
+        }
+
+        quaternion = wearable::utils::rotationMatrixToQuaternion(m_rotationMatrixBuffer);
+        return true;
+    }
+
+private:
+    yarp::dev::IFrameTransform* m_frameTransformInterface = nullptr;
+    std::string m_rootFrame, m_targetFrame;
+    yarp::sig::Matrix m_matrixBuffer;
+    wearable::Matrix3 m_rotationMatrixBuffer;
 };
 
 class IFrameTransformToIWear::Impl
@@ -39,57 +94,69 @@ public:
     TimeStamp timestamp;
     ParsedOptions options;
 
+    yarp::dev::IFrameTransform* frameTransformInterface = nullptr;
+
+    template <typename T>
+    using SensorsMap = std::map< std::string, SensorPtr<T> >;
+
     // Sensors stored for exposing wearable::IWear
-    std::map<std::string, std::shared_ptr<sensor::impl::PoseSensor>> poseSensors;
-    std::map<std::string, std::shared_ptr<sensor::impl::VirtualLinkKinSensor>>
-        virtualLinkKinSensors;
+    class PoseSensor;
+    SensorsMap<PoseSensor> poseSensorsMap;
+    // std::map<std::string, SensorPtr<VirtualLinkKinSensor>>
+    //     virtualLinkKinSensors;
 
-    bool allocateSensor(const wearable::sensor::SensorType type,
-                        const wearable::sensor::SensorName name,
-                        IAnalogSensorHandler handler);
-};
-
-// ================================
-// WEARABLE SENSORS IMPLEMENTATIONS // TODO
-// ================================
-
-class ForceTorque6DSensor : public IForceTorque6DSensor
-{
-public:
-    unsigned offset = 0;
-    bool groundReactionFT;
-    IAnalogSensorHandler handler;
-
-    ForceTorque6DSensor(SensorName name, IAnalogSensorHandler analogSensorHandler, SensorStatus status = SensorStatus::Unknown)
-        : IForceTorque6DSensor(name, status), handler(analogSensorHandler)
-    {}
-
-    void setStatus(const SensorStatus status) { m_status = status; }
-
-    bool getForceTorque6D(Vector3& force3D, Vector3& torque3D) const override
+    // bool allocateSensor(const wearable::sensor::SensorType type,
+    //                     const wearable::sensor::SensorName name,
+    //                     IAnalogSensorHandler handler);
+    template <typename SensorType>
+    bool isSensorAvailable(const std::string& name, const SensorsMap<SensorType>& map)
     {
-        // Dirty workaround to set the status from a const method and call non-const methods of the handler
-        auto nonConstThis = const_cast<ForceTorque6DSensor*>(this);
-        bool dataOk = nonConstThis->handler.readData();
-        nonConstThis->setStatus(nonConstThis->handler.getStatus());
-
-        // TODO: The positions of force and torques are hardcoded. Forces should be the first
-        //       triplet of elements of the read vector and torques the second one.
-        bool ok = dataOk && nonConstThis->handler.getData(force3D, offset) && nonConstThis->handler.getData(torque3D, offset + 3);
-        if (groundReactionFT) {
-            force3D[0] = -1 * force3D[0];
-            force3D[1] = -1 * force3D[1];
-            force3D[2] = -1 * force3D[2];
-
-            torque3D[0] = -1 * torque3D[0];
-            torque3D[1] = -1 * torque3D[1];
-            torque3D[2] = -1 * torque3D[2];
+        if (map.find(name) == map.end())
+        {
+            return false;
         }
-        return ok;
+        return true;
     }
 };
 
-// TODO: implement all the other sensors
+// ================================
+// WEARABLE SENSORS IMPLEMENTATIONS
+// ================================
+
+class IFrameTransformToIWear::Impl::PoseSensor : public wearable::sensor::IPoseSensor
+{
+public:
+    // ------------------------
+    // Constructor / Destructor
+    // ------------------------
+    PoseSensor(
+        IFrameTransformHandler* frameTransformHandler,
+        const wearable::sensor::SensorName aName,
+        const wearable::sensor::SensorStatus aStatus = wearable::sensor::SensorStatus::Unknown)
+        : IPoseSensor(aName, aStatus)
+        , m_frameTransformHandler(frameTransformHandler)
+    {}
+
+    ~PoseSensor() override = default;
+
+    // -------------------------
+    // IOrientationSensor interface
+    // -------------------------
+    bool getPose(Quaternion& orientation, Vector3& position) const override
+    {
+        return this->m_frameTransformHandler->getTransform(orientation, position);
+    }
+
+    // ------------------------
+    // Custom utility functions
+    // ------------------------
+    inline void setStatus(const wearable::sensor::SensorStatus aStatus) { m_status = aStatus; }
+
+private:
+    IFrameTransformHandler* m_frameTransformHandler = nullptr;
+};
+
+// TODO: implement other sensors
 
 // ======================
 // IFrameTransformToIWear
@@ -164,6 +231,11 @@ bool IFrameTransformToIWear::open(yarp::os::Searchable& config)
         return false;
     }
 
+    if (!(config.check("frameIDs") && config.find("frameIDs").isList())) {
+        yError() << LogPrefix << "Parameter 'frameIDs' missing or invalid";
+        return false;
+    }
+
     // ===============
     // READ PARAMETERS
     // ===============
@@ -171,11 +243,22 @@ bool IFrameTransformToIWear::open(yarp::os::Searchable& config)
     pImpl->options.wearableName = config.find("wearableName").asString();
     pImpl->options.rootFrameID = config.find("rootFrameID").asString();
     std::string sensorType = config.find("wearableSensorType").asString();
+    pImpl->options.wearableSensorType = sensorTypeFromString(sensorType);
+
+    auto frameIDsBottle = config.find("frameIDs").asList();
+    for (size_t it = 0; it < frameIDsBottle->size(); it++)
+    {
+        pImpl->options.frameIDs.push_back(frameIDsBottle->get(it).asString());
+    }
 
     yInfo() << LogPrefix << "*** ====================";
     yInfo() << LogPrefix << "*** Wearable name      :" << pImpl->options.wearableName;
     yInfo() << LogPrefix << "*** Sensor Type        :" << sensorType;
     yInfo() << LogPrefix << "*** Root Frame ID      :" << pImpl->options.rootFrameID;
+    yInfo() << LogPrefix << "*** Selected Frame IDs :";
+    for (auto ID : pImpl->options.frameIDs) {
+        yInfo() << LogPrefix << "***                     " << ID;
+    }
     yInfo() << LogPrefix << "*** ====================";
 
     // =====================
@@ -188,7 +271,6 @@ bool IFrameTransformToIWear::open(yarp::os::Searchable& config)
 bool IFrameTransformToIWear::close()
 {
     detach();
-    pImpl->iSensor.reset();
     return true;
 }
 
@@ -198,99 +280,103 @@ yarp::os::Stamp IFrameTransformToIWear::getLastInputStamp()
     return yarp::os::Stamp(pImpl->timestamp.sequenceNumber, yarp::os::Time::now());
 }
 
-// TODO
-bool IFrameTransformToIWear::Impl::allocateSensor(const wearable::sensor::SensorType type,
-                                                const wearable::sensor::SensorName name,
-                                                IAnalogSensorHandler handler)
-{
-    // The sensors are initialized as Ok in order to trigger the first data read.
-    // If there is any error during the first read, the sensor updates its own status
-    // that is then propagated to the global IWear status.
-    switch (type) {
-        case wearable::sensor::SensorType::Force3DSensor: {
-            auto sensor = std::make_shared<Force3DSensor>(name, handler, SensorStatus::Ok);
-            sensor->offset = options.channelOffset;
-            iSensor = std::dynamic_pointer_cast<ISensor>(sensor);
-            break;
-        }
-        case wearable::sensor::SensorType::ForceTorque6DSensor: {
-            auto sensor = std::make_shared<ForceTorque6DSensor>(name, handler, SensorStatus::Ok);
-            sensor->offset = options.channelOffset;
-            sensor->groundReactionFT = options.getGroundReactionFT;
-            iSensor = std::dynamic_pointer_cast<ISensor>(sensor);
-            break;
-        }
-        case wearable::sensor::SensorType::TemperatureSensor: {
-            auto sensor = std::make_shared<TemperatureSensor>(name, handler, SensorStatus::Ok);
-            sensor->offset = options.channelOffset;
-            iSensor = std::dynamic_pointer_cast<ISensor>(sensor);
-            break;
-        }
-        case wearable::sensor::SensorType::Torque3DSensor: {
-            auto sensor = std::make_shared<Torque3DSensor>(name, handler, SensorStatus::Ok);
-            sensor->offset = options.channelOffset;
-            iSensor = std::dynamic_pointer_cast<ISensor>(sensor);
-            break;
-        }
-        case wearable::sensor::SensorType::SkinSensor: {
-            auto sensor = std::make_shared<SkinSensor>(name, handler, SensorStatus::Ok);
-            sensor->offset = options.channelOffset;
-            iSensor = std::dynamic_pointer_cast<ISensor>(sensor);
-            break;
-        }
-        default:
-            // TODO: implement the remaining sensors
-            return false;
-    }
+// // TODO
+// bool IFrameTransformToIWear::Impl::allocateSensor(const wearable::sensor::SensorType type,
+//                                                 const wearable::sensor::SensorName name,
+//                                                 IAnalogSensorHandler handler)
+// {
+//     // The sensors are initialized as Ok in order to trigger the first data read.
+//     // If there is any error during the first read, the sensor updates its own status
+//     // that is then propagated to the global IWear status.
+//     switch (type) {
+//         case wearable::sensor::SensorType::Force3DSensor: {
+//             auto sensor = std::make_shared<Force3DSensor>(name, handler, SensorStatus::Ok);
+//             sensor->offset = options.channelOffset;
+//             iSensor = std::dynamic_pointer_cast<ISensor>(sensor);
+//             break;
+//         }
+//         case wearable::sensor::SensorType::ForceTorque6DSensor: {
+//             auto sensor = std::make_shared<ForceTorque6DSensor>(name, handler, SensorStatus::Ok);
+//             sensor->offset = options.channelOffset;
+//             sensor->groundReactionFT = options.getGroundReactionFT;
+//             iSensor = std::dynamic_pointer_cast<ISensor>(sensor);
+//             break;
+//         }
+//         case wearable::sensor::SensorType::TemperatureSensor: {
+//             auto sensor = std::make_shared<TemperatureSensor>(name, handler, SensorStatus::Ok);
+//             sensor->offset = options.channelOffset;
+//             iSensor = std::dynamic_pointer_cast<ISensor>(sensor);
+//             break;
+//         }
+//         case wearable::sensor::SensorType::Torque3DSensor: {
+//             auto sensor = std::make_shared<Torque3DSensor>(name, handler, SensorStatus::Ok);
+//             sensor->offset = options.channelOffset;
+//             iSensor = std::dynamic_pointer_cast<ISensor>(sensor);
+//             break;
+//         }
+//         case wearable::sensor::SensorType::SkinSensor: {
+//             auto sensor = std::make_shared<SkinSensor>(name, handler, SensorStatus::Ok);
+//             sensor->offset = options.channelOffset;
+//             iSensor = std::dynamic_pointer_cast<ISensor>(sensor);
+//             break;
+//         }
+//         default:
+//             // TODO: implement the remaining sensors
+//             return false;
+//     }
 
-    return true;
-}
+//     return true;
+// }
 
 // TODO
 bool IFrameTransformToIWear::attach(yarp::dev::PolyDriver* poly)
 {
-    IAnalogSensorHandler handler;
-    handler.buffer.resize(pImpl->options.numberOfChannels);
-
     if (!poly) {
         yError() << LogPrefix << "Passed PolyDriver is nullptr";
         return false;
     }
 
-    if (!(poly->view(handler.interface) && handler.interface)) {
-        yError() << LogPrefix << "Failed to view the IAnalogSensor interface from the PolyDriver";
+    if (!(poly->view(pImpl->frameTransformInterface) && pImpl->frameTransformInterface)) {
+        yError() << LogPrefix << "Failed to view the IFrameTransform interface from the PolyDriver";
         return false;
     }
 
-    // ===================
-    // CHECK THE INTERFACE
-    // ===================
+    // ===========
+    // ADD SENSORS
+    // ===========
 
-    if (handler.interface->getChannels() == 0) {
-        yError() << LogPrefix << "The number of channels is 0";
+    // sensor prefixes
+    auto poseSensPrefix = getWearableName() + sensor::IPoseSensor::getPrefix();
+    auto virtualLinkSensPrefix = getWearableName() + sensor::IVirtualLinkKinSensor::getPrefix();
+
+    if (!pImpl->frameTransformInterface->frameExists(pImpl->options.rootFrameID)) {
+        yError() << LogPrefix << "No transform found for the root frame ( " << pImpl->options.rootFrameID << " )";
         return false;
     }
 
-    if (handler.interface->getChannels()
-        != pImpl->options.numberOfChannels + pImpl->options.channelOffset) {
-        yError() << LogPrefix << "The number of sensor channels ("
-                 << handler.interface->getChannels()
-                 << ") is different than the number specified in the options plus the offset ("
-                 << pImpl->options.numberOfChannels + pImpl->options.channelOffset << ")";
-        return false;
-    }
+    for (auto ID : pImpl->options.frameIDs) {
 
-    for (unsigned i = 0; i < handler.interface->getChannels(); ++i) {
-        if (handler.interface->getState(i) != yarp::dev::IAnalogSensor::AS_OK) {
-            yError() << LogPrefix << "The status of IAnalogSensor interface for channel" << i
-                     << "is not AS_OK (" << handler.interface->getState(i) << ")";
+        if (!pImpl->frameTransformInterface->frameExists(ID)) {
+            yError() << LogPrefix << "No transform found for the frame ( " << ID << " )";
             return false;
         }
-    }
 
-    if (!pImpl->allocateSensor(pImpl->options.wearableSensorType, pImpl->options.sensorName, handler)) {
-        yError() << LogPrefix << "Failed to allocate a new sensor of the specified type";
-        return false;
+        // The sensors are initialized as Ok in order to trigger the first data read.
+        // If there is any error during the first read, the sensor updates its own status
+        // that is then propagated to the global IWear status.
+        switch (pImpl->options.wearableSensorType) {
+            case wearable::sensor::SensorType::PoseSensor: {
+                auto poseSensorName = poseSensPrefix + ID;
+                auto poseSensor = std::make_shared<IFrameTransformToIWear::Impl::PoseSensor>(new IFrameTransformHandler(ID, pImpl->options.rootFrameID, pImpl->frameTransformInterface), poseSensorName, wearable::sensor::SensorStatus::Ok);
+                pImpl->poseSensorsMap.emplace(poseSensorName, poseSensor);
+                break;
+            }
+            default:
+                // TODO: implement the remaining sensors
+                yError() << LogPrefix << "Selected wearableSensorType is not valid.";
+                return false;
+        }
+
     }
 
     // Notify that the sensor is ready to be used
@@ -328,25 +414,42 @@ bool IFrameTransformToIWear::detachAll()
 
 wearable::SensorPtr<const ISensor> IFrameTransformToIWear::getSensor(const SensorName name) const
 {
-    // This device can provide only one sensor. Check if the name matches.
-    if (!(pImpl->iSensor && (pImpl->iSensor->getSensorName() == name))) {
-        yError() << LogPrefix << "Failed to get sensor" << name;
-        return nullptr;
+    wearable::VectorOfSensorPtr<const wearable::sensor::ISensor> sensors = getAllSensors();
+    for (const auto& s : sensors) {
+        if (s->getSensorName() == name) {
+            return s;
+        }
     }
-
-    return pImpl->iSensor;
+    yWarning() << LogPrefix << "User specified name <" << name << "> not found.";
+    return nullptr;
 }
 
 wearable::VectorOfSensorPtr<const ISensor>
 IFrameTransformToIWear::getSensors(const SensorType type) const
 {
-    wearable::VectorOfSensorPtr<const ISensor> vector;
-
-    if (pImpl->options.wearableSensorType == type) {
-        vector.push_back(getSensor(pImpl->options.sensorName));
+    wearable::VectorOfSensorPtr<const wearable::sensor::ISensor> allSensors;
+    switch (type) {
+        case wearable::sensor::SensorType::PoseSensor: {
+            allSensors.reserve(pImpl->poseSensorsMap.size());
+            for (const auto& poseSens : pImpl->poseSensorsMap ) {
+                allSensors.push_back(static_cast<SensorPtr<sensor::ISensor> >(poseSens.second));
+            }
+            break;
+        }
+        // case wearable::sensor::SensorType::VirtualLinkKinSensor: {
+        //     allSensors.reserve(pImpl->virtualLinkSensMap.size());
+        //     for (const auto& virtualLinkSens : pImpl->virtualLinkSensMap ) {
+        //         allSensors.push_back(static_cast<std::shared_ptr<sensor::ISensor> >(virtualLinkSens.second.nodeSensor));
+        //     }
+        //     break;
+        // }
+        default: {
+            yWarning() << LogPrefix << "Selected sensor type (" << static_cast<int>(type)
+                       << ") is not supported by IFrameTransformToIWear.";
+            return {};
+        }
     }
-
-    return vector;
+    return allSensors;
 }
 
 wearable::WearableName IFrameTransformToIWear::getWearableName() const
@@ -356,18 +459,8 @@ wearable::WearableName IFrameTransformToIWear::getWearableName() const
 
 wearable::WearStatus IFrameTransformToIWear::getStatus() const
 {
-    // This is necessary if something that uses the exposed IWear interface asks the status
-    // before IAnalogSensor is attached
-    if (pImpl->firstRun) {
-        return WearStatus::WaitingForFirstRead;
-    }
-
-    if (!pImpl->iSensor) {
-        yError() << LogPrefix << "The stored ISensor has not been yet allocated";
-        return WearStatus::Error;
-    }
-
-    return pImpl->iSensor->getSensorStatus();
+    // TODO 
+    return wearable::WearStatus::Ok;
 }
 
 wearable::TimeStamp IFrameTransformToIWear::getTimeStamp() const
@@ -387,25 +480,15 @@ IFrameTransformToIWear::getAccelerometer(const wearable::sensor::SensorName /*na
 }
 
 wearable::SensorPtr<const wearable::sensor::IForce3DSensor>
-IFrameTransformToIWear::getForce3DSensor(const wearable::sensor::SensorName name) const
+IFrameTransformToIWear::getForce3DSensor(const wearable::sensor::SensorName /*name*/) const
 {
-    if (!(pImpl->iSensor && (pImpl->iSensor->getSensorName() == name))) {
-        yError() << LogPrefix << "Failed to get sensor" << name;
-        return nullptr;
-    }
-
-    return std::dynamic_pointer_cast<const wearable::sensor::IForce3DSensor>(pImpl->iSensor);
+    return nullptr;
 }
 
 wearable::SensorPtr<const wearable::sensor::IForceTorque6DSensor>
-IFrameTransformToIWear::getForceTorque6DSensor(const wearable::sensor::SensorName name) const
+IFrameTransformToIWear::getForceTorque6DSensor(const wearable::sensor::SensorName /*name*/) const
 {
-    if (!(pImpl->iSensor && (pImpl->iSensor->getSensorName() == name))) {
-        yError() << LogPrefix << "Failed to get sensor" << name;
-        return nullptr;
-    }
-
-    return std::dynamic_pointer_cast<const wearable::sensor::IForceTorque6DSensor>(pImpl->iSensor);
+    return nullptr;
 }
 
 wearable::SensorPtr<const wearable::sensor::IGyroscope>
@@ -427,25 +510,15 @@ IFrameTransformToIWear::getOrientationSensor(const wearable::sensor::SensorName 
 }
 
 wearable::SensorPtr<const wearable::sensor::ITemperatureSensor>
-IFrameTransformToIWear::getTemperatureSensor(const wearable::sensor::SensorName name) const
+IFrameTransformToIWear::getTemperatureSensor(const wearable::sensor::SensorName /*name*/) const
 {
-    if (!(pImpl->iSensor && (pImpl->iSensor->getSensorName() == name))) {
-        yError() << LogPrefix << "Failed to get sensor" << name;
-        return nullptr;
-    }
-
-    return std::dynamic_pointer_cast<const wearable::sensor::ITemperatureSensor>(pImpl->iSensor);
+    return nullptr;
 }
 
 wearable::SensorPtr<const wearable::sensor::ITorque3DSensor>
-IFrameTransformToIWear::getTorque3DSensor(const wearable::sensor::SensorName name) const
+IFrameTransformToIWear::getTorque3DSensor(const wearable::sensor::SensorName /*name*/) const
 {
-    if (!(pImpl->iSensor && (pImpl->iSensor->getSensorName() == name))) {
-        yError() << LogPrefix << "Failed to get sensor" << name;
-        return nullptr;
-    }
-
-    return std::dynamic_pointer_cast<const wearable::sensor::ITorque3DSensor>(pImpl->iSensor);
+    return nullptr;
 }
 
 wearable::SensorPtr<const wearable::sensor::IEmgSensor>
@@ -462,9 +535,16 @@ IFrameTransformToIWear::getFreeBodyAccelerationSensor(
 }
 
 wearable::SensorPtr<const wearable::sensor::IPoseSensor>
-IFrameTransformToIWear::getPoseSensor(const wearable::sensor::SensorName /*name*/) const
+IFrameTransformToIWear::getPoseSensor(const wearable::sensor::SensorName name) const
 {
-    return nullptr;
+    if (!pImpl->isSensorAvailable(name, pImpl->poseSensorsMap))
+    {
+        yError() << LogPrefix << "Invalid sensor name.";
+        return nullptr;
+    }
+
+    return static_cast<std::shared_ptr <sensor::IPoseSensor> >(
+        pImpl->poseSensorsMap.at(static_cast<std::string>(name)));
 }
 
 wearable::SensorPtr<const wearable::sensor::IPositionSensor>
@@ -474,14 +554,9 @@ IFrameTransformToIWear::getPositionSensor(const wearable::sensor::SensorName /*n
 }
 
 wearable::SensorPtr<const wearable::sensor::ISkinSensor>
-IFrameTransformToIWear::getSkinSensor(const wearable::sensor::SensorName name) const
+IFrameTransformToIWear::getSkinSensor(const wearable::sensor::SensorName /*name*/) const
 {
-    if (!(pImpl->iSensor && (pImpl->iSensor->getSensorName() == name))) {
-        yError() << LogPrefix << "Failed to get sensor" << name;
-        return nullptr;
-    }
-
-    return std::dynamic_pointer_cast<const wearable::sensor::ISkinSensor>(pImpl->iSensor);
+    return nullptr;
 }
 
 wearable::SensorPtr<const wearable::sensor::IVirtualLinkKinSensor>
