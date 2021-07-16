@@ -13,7 +13,6 @@
     <param name="wearableName">TransformServer</param>
     <param name="rootFrameID">ground</param>
     <param name="wearableSensorType">PoseSensor</param>
-
     <param name="frameIDs">(ground /iCub/root_link_fake)</param>
     
     <action phase="startup" level="5" type="attach">
